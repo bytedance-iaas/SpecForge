@@ -76,6 +76,9 @@ def _apply_loss_mask_from_chat_template(
     assistant_message_separator = (
         f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
     )
+    # assistant_message_separator = (
+    #     chat_template.assistant_header
+    # )
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
