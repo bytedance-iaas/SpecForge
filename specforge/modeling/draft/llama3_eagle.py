@@ -1219,9 +1219,165 @@ class LlamaRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
+from dataclasses import dataclass
+
+@dataclass
+class EngramCfg:
+    enabled: bool = True
+
+    # hash/embedding
+    pad_id: int = 0
+    max_ngram_size: int = 3          # 2~N gram
+    n_head_per_ngram: int = 8
+    n_embed_per_ngram: int = 512
+    head_mod: int = 65536            # hash vocab size (建议 2^k)
+    seed: int = 0
+
+    # conv
+    kernel_size: int = 4
+
+class TorchNgramHasher(nn.Module):
+    def __init__(self, pad_id: int, max_ngram_size: int, n_head_per_ngram: int, head_mod: int, seed: int):
+        super().__init__()
+        self.pad_id = int(pad_id)
+        self.max_ngram_size = int(max_ngram_size)
+        self.n_head_per_ngram = int(n_head_per_ngram)
+        self.head_mod = int(head_mod)
+
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        multipliers = torch.randint(1, 2**31 - 1, (self.max_ngram_size,), generator=g, dtype=torch.int64)
+        multipliers = multipliers * 2 + 1
+        self.register_buffer("multipliers", multipliers, persistent=True)
+
+        H_total = (self.max_ngram_size - 1) * self.n_head_per_ngram
+        salts = torch.randint(0, 2**31 - 1, (H_total,), generator=g, dtype=torch.int64)
+        self.register_buffer("salts", salts, persistent=True)
+
+    def forward(self, input_ids: torch.LongTensor) -> torch.LongTensor:
+        x = input_ids.to(dtype=torch.int64)
+        B, L = x.shape
+
+        def shift(k: int):
+            if k == 0:
+                return x
+            pad = torch.full((B, k), self.pad_id, device=x.device, dtype=torch.int64)
+            return torch.cat([pad, x[:, :-k]], dim=1)
+
+        shifts = [shift(k) for k in range(self.max_ngram_size)]
+
+        hashes = []
+        head_idx = 0
+        for n in range(2, self.max_ngram_size + 1):
+            mix = shifts[0] * self.multipliers[0]
+            for k in range(1, n):
+                mix = torch.bitwise_xor(mix, shifts[k] * self.multipliers[k])
+
+            for _ in range(self.n_head_per_ngram):
+                h = (mix + self.salts[head_idx]) % self.head_mod
+                hashes.append(h.to(dtype=torch.long))
+                head_idx += 1
+
+        return torch.stack(hashes, dim=-1)  # (B,L,H_total)
+
+class ShortConvHC(nn.Module):
+    def __init__(self, hidden_size: int, hc_mult: int, kernel_size: int, dilation: int, norm_eps: float):
+        super().__init__()
+        self.hc_mult = hc_mult
+        total = hidden_size * hc_mult
+        self.conv = nn.Conv1d(
+            in_channels=total,
+            out_channels=total,
+            kernel_size=kernel_size,
+            groups=total,
+            bias=False,
+            padding=(kernel_size - 1) * dilation,
+            dilation=dilation,
+        )
+        self.norms = nn.ModuleList([nn.RMSNorm(hidden_size, eps=norm_eps) for _ in range(hc_mult)])
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,L,HC,D)
+        B, L, HC, D = x.shape
+        assert HC == self.hc_mult
+
+        chunks = [self.norms[i](x[:, :, i, :]) for i in range(HC)]
+        x_norm = torch.cat(chunks, dim=-1)              # (B,L,HC*D)
+        y = self.conv(x_norm.transpose(1, 2))           # (B,HC*D,L+pad)
+        y = y[..., :L]
+        y = self.act(y).transpose(1, 2).view(B, L, HC, D).contiguous()
+        return y
+
+class EngramHC2(nn.Module):
+    """
+    给 (input_emb, hidden_states) 两路用的 Engram：输入/输出都是 (B,L,2,D)
+    """
+    def __init__(self, hidden_size: int, rms_eps: float, cfg):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cfg = cfg
+        self.hc_mult = 2
+
+        self.hasher = TorchNgramHasher(
+            pad_id=cfg.pad_id,
+            max_ngram_size=cfg.max_ngram_size,
+            n_head_per_ngram=cfg.n_head_per_ngram,
+            head_mod=cfg.head_mod,
+            seed=cfg.seed,
+        )
+
+        per_head_dim = cfg.n_embed_per_ngram // cfg.n_head_per_ngram
+        assert cfg.n_embed_per_ngram % cfg.n_head_per_ngram == 0
+
+        self.emb = nn.Embedding(cfg.head_mod, per_head_dim)
+
+        engram_hidden = (cfg.max_ngram_size - 1) * cfg.n_embed_per_ngram
+        self.value_proj = nn.Linear(engram_hidden, hidden_size, bias=False)
+        self.key_projs = nn.ModuleList([nn.Linear(engram_hidden, hidden_size, bias=False) for _ in range(self.hc_mult)])
+
+        self.norm_k = nn.ModuleList([nn.RMSNorm(hidden_size, eps=rms_eps) for _ in range(self.hc_mult)])
+        self.norm_q = nn.ModuleList([nn.RMSNorm(hidden_size, eps=rms_eps) for _ in range(self.hc_mult)])
+
+        self.short_conv = ShortConvHC(
+            hidden_size=hidden_size,
+            hc_mult=self.hc_mult,
+            kernel_size=cfg.kernel_size,
+            dilation=cfg.max_ngram_size,
+            norm_eps=rms_eps,
+        )
+
+    def forward(self, hc_states: torch.Tensor, input_ids: torch.LongTensor) -> torch.Tensor:
+        """
+        hc_states: (B,L,2,D)
+        input_ids: (B,L)
+        """
+        B, L, HC, D = hc_states.shape
+        assert HC == 2 and D == self.hidden_size
+
+        hash_ids = self.hasher(input_ids)                 # (B,L,H_total)
+        head_emb = self.emb(hash_ids)                     # (B,L,H_total,per_head_dim)
+        emb_flat = head_emb.reshape(B, L, -1)             # (B,L,engram_hidden)
+
+        gates = []
+        for i in range(2):
+            k = self.norm_k[i](self.key_projs[i](emb_flat))
+            q = self.norm_q[i](hc_states[:, :, i, :])
+            g = (k * q).sum(dim=-1) / math.sqrt(D)
+            g = g.abs().clamp_min(1e-6).sqrt() * g.sign()
+            g = torch.sigmoid(g).unsqueeze(-1)            # (B,L,1)
+            gates.append(g)
+        gates = torch.stack(gates, dim=2)                 # (B,L,2,1)
+
+        v = self.value_proj(emb_flat).unsqueeze(2)        # (B,L,1,D)
+        v = v * gates                                     # (B,L,2,D)
+
+        out = v + self.short_conv(v)
+        return out
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "sdpa", use_engram: bool = False, engram_cfg=None):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -1248,6 +1404,19 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # self.use_engram = bool(use_engram)
+        import os
+        self.use_engram = os.getenv("USE_ENGRAM", "0").lower() in ("1", "true", "yes")
+        self.engram_mod = None
+        if self.use_engram:
+            if engram_cfg is None:
+                engram_cfg = EngramCfg(enabled=True, pad_id=0)  # pad_id 按 tokenizer 改
+            self.engram_mod = EngramHC2(
+                hidden_size=config.hidden_size,
+                rms_eps=config.rms_norm_eps,
+                cfg=engram_cfg,
+            )
+
     def forward(
         self,
         input_emb: torch.Tensor,
@@ -1258,6 +1427,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        input_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1279,6 +1449,12 @@ class LlamaDecoderLayer(nn.Module):
 
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
+
+        # ✅ Engram（两路当 HC_MULT=2）
+        if self.use_engram and self.engram_mod is not None:
+            hc = torch.stack([input_emb, hidden_states], dim=2)     # (B,L,2,D)
+            hc = hc + self.engram_mod(hc_states=hc, input_ids=input_ids)
+            input_emb, hidden_states = hc[:, :, 0, :], hc[:, :, 1, :]
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         # Self Attention
@@ -1345,6 +1521,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         ttt_length: int = 1,
+        input_ids: Optional[torch.LongTensor] = None,
     ):
         """
         Arguments:
@@ -1388,6 +1565,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=None,
             output_attentions=False,
             use_cache=False,
+            input_ids = input_ids,
         )
 
         # norm
@@ -1416,6 +1594,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        input_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         return self.midlayer(
             input_emb=input_embeds,
@@ -1426,4 +1605,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
+            input_ids=input_ids,
         )

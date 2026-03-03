@@ -244,6 +244,7 @@ class OnlineEagle3Model(Eagle3Model):
                 position_ids=state.position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
+                input_ids = input_ids,
             )
 
             # update hidden states for next step
@@ -533,6 +534,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
+                input_ids = input_ids,
             )
 
             # update hidden states for next step

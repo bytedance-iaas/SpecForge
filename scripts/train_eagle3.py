@@ -406,7 +406,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         ).cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
-            draft_model_config,
+            draft_model_config, 
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
@@ -438,6 +438,8 @@ def build_dataloaders(
         generator=safe_conversations_generator,
         gen_kwargs={"file_path": args.train_data_path},
     )
+    print("len=", len(train_dataset))
+    print(next(iter(train_dataset)))
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )

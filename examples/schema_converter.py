@@ -1,9 +1,7 @@
 import json
 
 input_file = "/data01/qian_dev/datasets/sharegpt_train.jsonl"
-output_file = "/data01/qian_dev/datasets/sharegpt_train_converted.jsonl"
-
-MAX_ENTRIES=100
+output_file = "/data01/qian_dev/datasets/sharegpt_train_converted_all.jsonl"
 
 MAX_ENTRIES = None   # ← 改这里，例如 100；None 表示全部
 
@@ -51,7 +49,7 @@ def convert_file(input_path, output_path):
             if new_msgs[0]["role"] != "system":
                 new_msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
 
-            fout.write(json.dumps({"messages": new_msgs}, ensure_ascii=False) + "\n")
+            fout.write(json.dumps({"conversations": new_msgs}, ensure_ascii=False) + "\n")
             written += 1
 
     print("written:", written)

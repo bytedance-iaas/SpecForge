@@ -7,7 +7,7 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 # support tp4/tp8 train eagle3 for Qwen3-30B-A3B
 NUM_GPUS=1
 TP_SIZE=1
-BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-1}
 
 torchrun \
     --standalone \
