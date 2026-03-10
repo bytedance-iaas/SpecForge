@@ -53,8 +53,9 @@ class GSM8KBenchmarker(Benchmarker):
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[int]]:
         """Load and preprocess GSM8K dataset."""
         # Read data
-        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-        data_path = download_and_cache_file(url)
+        # url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        # data_path = download_and_cache_file(url)
+        data_path="/data01/qian_dev/datasets/gsm8k/test.jsonl"
         lines = list(read_jsonl(data_path))
 
         # Construct prompts
